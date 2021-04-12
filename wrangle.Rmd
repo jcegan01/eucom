@@ -1,0 +1,262 @@
+---
+title: "wrangle"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r echo=FALSE}
+### Load data from Our World in Data
+library(dplyr)
+library(zoo)
+library(ggplot2)
+library(openxlsx)
+
+theme_set( theme_bw() + theme( legend.position="bottom" ) +
+             theme( legend.title=element_blank() ) +
+             theme(plot.title = element_text(hjust = 0.5) ) +
+             theme( text = element_text(size=12) ) )
+
+# Assumptions
+# rate of doses lost
+waste_rate <- 0.000
+# average time between 1st and 2nd dose
+t1st2nd <- (56+84)/2 #8 to 12 weeks for Oxford AstraZenca
+
+# Constants
+dfmts <- c('%Y-%m-%d', '%m/%d/%Y')
+Ecountries <- c('Ukraine','Slovenia')
+nper <- 14 # days to smooth supply
+
+# truth URL from the CDC ensemble 
+vurl <- 'https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/vaccinations/vaccinations.csv'
+df <- read.csv( vurl )
+save(df, file = "data/owid.rda")
+```
+
+Calculate daily history
+```{r echo=FALSE}
+# (current capacity to administer doses per day is in daily_vaccinations - 7-day moving avg)
+dcap <- df %>% filter( location %in% Ecountries ) %>% 
+  group_by( location ) %>%
+  mutate( date = as.Date(date, tryFormats = dfmts)
+          , total_vaccinations = na.approx( total_vaccinations, na.rm=FALSE ) #replace NA by interpolation
+          , people_vaccinated_per_hundred = na.approx( people_vaccinated_per_hundred, na.rm=FALSE )
+  ) %>% ungroup()
+latest_history_date <- max(dcap$date)
+print( paste('Latest data from', latest_history_date) )
+```
+
+Totals
+```{r echo=FALSE}
+tmp <- lapply( Ecountries, function( state ){
+  idx <- dcap$location==state & dcap$date==latest_history_date
+  print( paste('Total Administered', state, dcap$total_vaccinations[idx]) )
+  print( paste('People with 1+ Doses', state, dcap$people_vaccinated[idx]) )
+  print( paste('People with 2+ Doses', state, dcap$people_fully_vaccinated[idx]) )
+  print( paste('Total Administered per 100k', state, dcap$total_vaccinations_per_hundred[idx]*1000) )
+  print( paste('People with 1+ Doses per 100k', state, dcap$people_vaccinated_per_hundred[idx]*1000) )
+  print( paste('People with 2+ Doses per 100k', state, dcap$people_fully_vaccinated_per_hundred[idx]*1000) )
+} )
+```
+
+CDC population numbers
+```{r echo=FALSE}
+pop <- dcap %>% mutate( pop1 = total_vaccinations/(total_vaccinations_per_hundred/100)) %>%
+      group_by( location ) %>% summarise( m=mean(pop1, na.rm=TRUE), s1=sd(pop1, na.rm=TRUE), .groups='drop_last' )
+print(pop)
+```
+
+Ukraine population 44.39M
+```{r echo=FALSE}
+pop$m[which(pop$location =="Ukraine")] <- 44390000
+```
+
+Plot daily_vaccinations (it is already 7-day smoothed in the original data)
+```{r echo=FALSE}
+dp <- dcap %>% filter( date >= "2021-03-01" ) %>% select(date,location,daily_vaccinations) 
+ggplot( dp, aes(x = date, y=daily_vaccinations) ) +
+  facet_wrap(~ location, nrow=2, scale='free_y' ) +
+  geom_line() + 
+  theme(axis.title.x = element_blank()) +
+  scale_x_date(date_labels = '%b%e' ) +
+  ylab('Daily Vaccinations') +
+  ggtitle('EUCOM') +
+  scale_y_continuous(label = scales::unit_format(unit = "K", scale = 1e-3, sep = "")
+                     , expand = c(0, 1000), limits = c(1000, NA))
+```
+
+Forecasting: 
+```{r echo=FALSE}
+# Forecast function
+fcastfn <- function( l, c, al, be ){
+  #setup
+    fdays <- as.Date('2021-10-15') - latest_history_date # number of days to forecast
+    dt <- dcap %>% filter( location == l ) %>% 
+      select( all_of(c('date',c)) ) 
+    z <- read.zoo( dt )
+    zz <- z
+    time(zz) <- seq_along(time(zz))
+  # forecast model
+    sm <- HoltWinters( as.ts(zz[-(1:(nper-1))]), alpha=al, beta=be, gamma=FALSE )
+    print( paste('location', l, 'alpha', sm$alpha, 'beta', sm$beta, 'level', sm$coefficients['a'], 'trend', sm$coefficients['b']) )
+    pr <- predict(sm, fdays, prediction.interval=TRUE, level = 0.95)
+    dates <- seq(max(dt$date)+1, by = "day", length.out = fdays)
+    prdf <- data.frame( dates, pr ) 
+    prdf[prdf < 0] <- 0    # override negative predictions
+    cols <- paste0(c, '_', colnames(prdf[1,-1]))
+    colnames(prdf) <- c('date',cols)
+    res <- prdf %>% mutate( 'location' = l )
+}
+print( paste('Latest data from', latest_history_date) )
+```
+
+Forecasts
+```{r echo=FALSE}
+f <- list( )
+beta_vaccinations <- 0.03 # Beta forced because of recent spikes in NH
+```
+
+Forecast Cumulative number of doses **administered**
+```{r echo=FALSE}
+print( paste('Latest data from', latest_history_date) )
+tmp <- lapply( Ecountries, fcastfn, 'total_vaccinations', NULL, beta_vaccinations )  # first argument, function, optional arguments
+f[[1]] <- bind_rows( tmp ) 
+```
+
+Forecast **Daily** number of doses **administered**
+```{r echo=FALSE}
+print( paste('Latest data from', latest_history_date) )
+# Forecast daily vaccinations
+tmp <- lapply( Ecountries, fcastfn, 'daily_vaccinations', NULL, beta_vaccinations ) # first argument, function, optional arguments
+f[[2]] <- bind_rows( tmp ) %>% select(-date,-location)
+```
+
+Forecast people vaccinated per capita
+```{r echo=FALSE}
+print( paste('Latest data from', latest_history_date) )
+tmp <- lapply( Ecountries, fcastfn, 'people_vaccinated_per_hundred', NULL, beta_vaccinations ) # first argument, function, optional arguments
+f[[3]] <- bind_rows( tmp ) %>% select(-date,-location)
+```
+
+Bind history and prediction
+```{r echo=FALSE}
+fcast <- bind_cols( f ) # JCwhat structure to what structure?
+latest_fcast_date <- max(fcast$date)
+dcap_s <- dcap %>% select( date, location, daily_vaccinations, total_vaccinations, people_vaccinated_per_hundred)
+fcast_s <- fcast %>% select(date, location, daily_vaccinations_fit, total_vaccinations_fit, people_vaccinated_per_hundred_fit)
+colnames(fcast_s) <- colnames(dcap_s)
+dfw <- bind_rows( dcap_s, fcast_s ) 
+  #mutate( daily_available = total_distributed*(1-waste_rate) - total_vaccinations ) # total availability level
+```
+
+Plot Forecast of Cumulative number of doses distributed & administered
+```{r echo=FALSE}
+colors <- c('daily_vaccinations','total_vaccinations')
+dp <- dfw %>% filter( date <= (latest_history_date+14) ) %>%
+  tidyr::pivot_longer( cols = all_of(colors), names_to="s", values_to="value", values_drop_na=TRUE ) #change "colors" vars into 1 column with associated value
+cnames <- c('Daily','Cumulative')
+dp <- dp %>% mutate( n = NA ) #add new variable n
+dp$n[dp$s %in% colors] <- cnames[match(dp$s,colors)] #assign a cname to each 
+ggplot( dp, aes(x = date, y=value, color=n) ) +
+  facet_wrap('~ location', nrow=2, scale='free_y' ) +
+  geom_line() + 
+  geom_vline(xintercept=latest_history_date, linetype="dashed", 
+             color = "gray") +  
+  ggtitle( paste('Latest data from', latest_history_date) ) +
+  theme(axis.title.x = element_blank()) +
+  scale_x_date( date_labels = '%b%e' ) +
+  ylab('Cummulative Number of Doses') +
+  scale_y_continuous(label = scales::unit_format(unit = "K", scale = 1e-3, sep = "")
+                     , expand = c(0, 0), limits = c(0, NA))
+```
+
+Plot Forecasted Cumulative number of people vaccinated per hundred
+```{r echo=FALSE}
+ggplot( dp, aes(x = date, y=people_vaccinated_per_hundred) ) +
+  facet_wrap('~ location', nrow=2 ) +
+  geom_line() + 
+  geom_vline(xintercept=latest_history_date, linetype="dashed", 
+             color = "gray") +  
+  ggtitle( paste('Latest data from', latest_history_date) ) +
+  theme(axis.title.x = element_blank()) +
+  scale_x_date(date_labels = '%b%e' ) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, NA))
+```
+
+
+
+# CALCULATIONS for Shiny App
+```{r}
+# capacity assumptions
+sc <- left_join(sites, sitecap, by=c('date','location','type')) 
+
+# main dataframes
+colors <- c('daily_vaccinations','cap')
+cnames <- c('Doses administered','Max vaccination capacity')
+dp <- dfw %>% filter( date <= (latest_history_date+14) ) %>% 
+    tidyr::pivot_longer( cols = all_of(colors), names_to="s" 
+                         , values_to = "value",  values_drop_na = TRUE )
+dp <- dp %>% mutate( n = NA )
+dp$n[dp$s %in% colors] <- cnames[match(dp$s,colors)]
+
+# per capita values per state and Region 1 average
+dpp <- data.frame()
+for( var in c('total_vaccinations_per_hundred','people_vaccinated_per_hundred') ){
+  tmp <- dfw %>% select( c('date','location',all_of(var)) ) %>%
+                       tidyr::pivot_wider( names_from='location', values_from=var ) %>%
+                       mutate( avgr1 = (.[[2]]+.[[3]]+.[[4]]+ .[[5]]+ .[[6]]+ .[[7]]) /6 ) %>%
+                       tidyr::pivot_longer( cols=all_of(NEstates), names_to="location" 
+                                            , values_to = "value",  values_drop_na=FALSE ) %>%
+                       tidyr::pivot_longer( cols=c(value,avgr1), names_to="type" 
+                                            , values_to=var, values_drop_na=FALSE ) 
+  if ( nrow(dpp) == 0 )
+    dpp <- tmp
+  else
+    dpp[,var] <- tmp[,var]
+}
+dpc <- dpp %>% filter( date <= (latest_history_date+14) )
+
+# Perc people vaccinated over 16 yr old
+perc_pop_over16 <- data.frame( state = NEstates,
+                               perc_over16 = c(.821, .837, .827, .836, .83, .84) )
+for ( st in NEstates ){
+  idx <- dpp$location == st
+  dpp$people_vaccinated_per_hundredover16[idx] <- dpp$people_vaccinated_per_hundred[idx] / perc_pop_over16$perc_over16[perc_pop_over16$state==st]
+}
+  
+# dates where given vars will exceed given percentages of population
+calc_threshold_dates <- function(st, vartype){
+  tmp <- lapply( c('people_vaccinated_per_hundred','people_vaccinated_per_hundredover16'), function(colref){
+    thrs <- c(70, 90)
+    dates <- sapply( thrs, function(threshold){
+      datetmp <- dpp %>% filter( type==vartype & location==st & !!as.symbol(colref)>=threshold )
+      stopifnot( nrow(datetmp) > 0 )
+      return( min( datetmp$date ) )
+    } )
+    return( data.frame( location=st, type=vartype, colref, threshold=thrs, date=as.Date(dates) ) )
+  } ) %>% bind_rows()
+}
+datesdf <- lapply( NEstates, calc_threshold_dates, 'value' ) %>% bind_rows() %>% tidyr::pivot_wider( names_from=colref, values_from=date )
+datesdfavg <- calc_threshold_dates( 'Connecticut', 'avgr1' )
+
+# forecasted growth in daily vaccinations
+dvacgr <- dfw %>% group_by( location ) %>%
+                summarise( b = last(dd_vaccinations), .groups='drop_last' )
+```
+```{r}
+# test only
+tmp <- dpp %>% filter( type=='value' & location==NEstates[4]  )
+tmp
+```
+
+
+## SAVE data for Shiny App app.R and for in-transit graph of pre_proc_Tiberius.Rmd
+```{r echo=FALSE}
+print( paste('SAVING Latest data from', latest_history_date) )
+save(dfw, dp, dpp, dpc, datesdf, datesdfavg, dvacgr, latest_history_date, sc, pop, NEstates, stock7d,  file='app/app.RData')
+```
+
