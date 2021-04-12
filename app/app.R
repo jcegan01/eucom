@@ -17,7 +17,7 @@ theme_set( theme_bw() + theme( legend.position="bottom" ) +
              theme( legend.title=element_blank() ) )
 
 # load data and assumptions pre calculated in pre_proc.Rmd
-load( 'app.RData' )
+#JC load( 'app.RData' )
 
 # sidebar text: R1 average
 popcols <- list('people_vaccinated_per_hundred' = 'of population vaccinated (1+ doses) in '
