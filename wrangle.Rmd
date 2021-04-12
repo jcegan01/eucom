@@ -241,7 +241,7 @@ calc_threshold_dates <- function(st, vartype){
   } ) %>% bind_rows()
 }
 datesdf <- lapply( NEstates, calc_threshold_dates, 'value' ) %>% bind_rows() %>% tidyr::pivot_wider( names_from=colref, values_from=date )
-datesdfavg <- calc_threshold_dates( 'Connecticut', 'avgr1' )
+datesdfavg <- calc_threshold_dates( 'Connecticut', 'avgr1' ) #JC keep
 
 # forecasted growth in daily vaccinations
 dvacgr <- dfw %>% group_by( location ) %>%
